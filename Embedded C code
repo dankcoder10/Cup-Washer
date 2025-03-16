@@ -1,0 +1,397 @@
+IMPLEMENTED C CODE FOR THE CUP WASHER:
+
+#include "cmsis_os.h"
+#include "main.h"
+#include "FreeRTOS.h"
+#include "stm32f1xx_hal.h"
+#include "CupWasherControlMain.h"
+#include "PressureMap.h"
+#include "string.h"
+#include "stdio.h"
+#include "LCD_Display.h"
+#include "semphr.h"
+#include "task.h"
+#include "event_groups.h"
+#include "timers.h"
+#include "FreeRTOSConfig.h"
+
+extern UART_HandleTypeDef huart1;
+extern ADC_HandleTypeDef hadc1;
+extern DMA_HandleTypeDef hdma_adc1;
+
+uint8_t StatusBuffer[30];
+uint8_t tx_buf[50];
+uint16_t adcDMAbuffer[2] = {0};
+uint16_t PressureSensorADCValue;
+uint16_t TemperatureSensorADCValue;
+uint16_t WaterLevelSensorADCValue;
+uint8_t TemperatureValue;
+float TempVal = 0;
+float PressureValue;
+float WaterLevelValue;
+uint8_t count = 0;
+char lcd_pressure_buf[20] = {0};
+char lcd_temp_buf[20] = {0};
+char lcd_wl_buf[20] = {0};
+osThreadId_t WaterPumpControl_Handler;
+osThreadId_t SteamBoilerPressureControl_Handler;
+osThreadId_t MainTask_Handler;
+osThreadId_t LCD_Handler;
+static TimerHandle_t timer_1 =NULL;
+
+static const osThreadAttr_t WaterPumpControl_Attributes = {
+  .name = "WaterPumpControl",
+  .stack_size = 1024,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+
+static const osThreadAttr_t SteamBoilerPressureControl_Attributes = {
+  .name = "SteamBoilerPressureControl",
+  .stack_size = 1024,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+
+static const osThreadAttr_t MainTask_Attributes = {
+  .name = "MainTask",
+  .stack_size = 1024,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+
+static const osThreadAttr_t LCD_Display_Attributes = {
+  .name = "LCD_Display",
+  .stack_size = 1024,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+
+
+static void WaterPumpControl();
+static void SteamBoilerPressureControl();
+static void MainTask();
+static void LCDDisplay();
+static void SVOffCallback(TimerHandle_t xTimer);
+extern float Max6675_Read_Temp();
+
+void WasherControlMain()
+{
+
+	WaterPumpControl_Handler = osThreadNew(WaterPumpControl, NULL, &WaterPumpControl_Attributes);
+	SteamBoilerPressureControl_Handler = osThreadNew(SteamBoilerPressureControl, NULL, &SteamBoilerPressureControl_Attributes);
+	MainTask_Handler = osThreadNew(MainTask, NULL, &MainTask_Attributes);
+	LCD_Handler = osThreadNew(LCDDisplay, NULL, &LCD_Display_Attributes);
+	timer_1 = xTimerCreate("timer_1", 5000 , pdFALSE, 0,  SVOffCallback);
+
+	//Debug log for verifying task creation
+	if(WaterPumpControl_Handler != NULL)
+	{
+		strcpy((char*)StatusBuffer,"\nWater Pump Control created\r\n");
+		HAL_UART_Transmit(&huart1, StatusBuffer, strlen((char *)StatusBuffer), HAL_MAX_DELAY);
+	}
+
+	if(SteamBoilerPressureControl_Handler != NULL)
+	{
+		strcpy((char*)StatusBuffer,"Pressure Control created\r\n");
+		HAL_UART_Transmit(&huart1, StatusBuffer, strlen((char *)StatusBuffer), HAL_MAX_DELAY);
+	}
+
+	if(MainTask_Handler != NULL)
+	{
+		strcpy((char*)StatusBuffer,"Main Task Control created\r\n");
+		HAL_UART_Transmit(&huart1, StatusBuffer, strlen((char *)StatusBuffer), HAL_MAX_DELAY);
+	}
+
+	if(LCD_Handler != NULL)
+	{
+		strcpy((char*)StatusBuffer,"LCD Display created\r\n");
+		HAL_UART_Transmit(&huart1, StatusBuffer, strlen((char *)StatusBuffer), HAL_MAX_DELAY);
+	}
+
+	if(timer_1 != NULL)
+	{
+		strcpy((char*)StatusBuffer,"Timer created\r\n");
+		HAL_UART_Transmit(&huart1, StatusBuffer, strlen((char *)StatusBuffer), HAL_MAX_DELAY);
+	}
+
+	osDelay(10);
+	osKernelStart();
+	while(1)
+	{
+		osDelay(10);
+	}
+}
+
+static void WaterPumpControl()
+{
+	//first get the water level from sensor 
+	// if() water level is low then TURN ON PUMP until level is satisfied
+
+	HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adcDMAbuffer, 2);
+	while(1)
+	{
+		osDelay(100);
+		PressureSensorADCValue = adcDMAbuffer[0];		//A1 PIN
+		WaterLevelSensorADCValue = adcDMAbuffer[1];		//A2 PIN
+		TempVal = Max6675_Read_Temp();
+//		osDelay(10);
+
+		WaterLevelValue = (WaterLevelSensorADCValue * 3.3) / 4096 ;
+
+		if(WaterLevelValue < 0.3)
+		{
+			count++;
+			if((WaterLevelValue < 0.3) && (count == 17))
+			{
+				HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET);	//Pump ON
+				count = 0;
+				PumpOnCount++;
+			}
+		}
+		else
+		{
+			HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_SET);	//Pump OFF
+		}
+		osDelay(500);
+	}
+
+}
+
+static void SteamBoilerPressureControl()
+{
+	//get the pressure value from pressure sensor
+		//use mapping to convert the pressure range
+	//if pressure <(17-19 PSI) TURN ON HEATING ELEMENT
+
+	while(1)
+	{
+
+		osDelay(100);
+		TempVal = Max6675_Read_Temp();
+
+		for (uint16_t index = 0; pressureLookUpTable[index].endADCValue != INVALID_PRESSURE_SENSOR_ADC_VALUE ; ++index)
+		{
+		  if ((PressureSensorADCValue >= pressureLookUpTable[index].startADCValue) && (PressureSensorADCValue <= pressureLookUpTable[index].endADCValue))
+		  {
+			  PressureValue = pressureLookUpTable[index].pressure;
+		  }
+		}
+
+		if(PressureValue <= 19)
+		{
+			if(WaterLevelValue != 0 )
+			{
+				numcount++;
+				if(numcount == 800)
+				{
+					HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_RESET);	//Heater ON
+					numcount = 0;
+				}
+			}
+			else
+			{
+				HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET);	//Heater OFF
+			}
+		}
+		else if(PressureValue > 23)
+		{
+			HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET);	//Heater OFF
+		}
+
+		osDelay(10);
+	}//end while
+}//end steam boiler pressure control
+
+void LCDDisplay()
+{
+	lcd_init();
+	lcd_clear();
+
+	while(1)
+	{
+		lcd_put_cur(0, 0);
+		sprintf((char *)lcd_pressure_buf,"P:%.2f", PressureValue);
+		lcd_send_string(lcd_pressure_buf);
+		lcd_put_cur(0, 8);
+		sprintf((char *)lcd_temp_buf,"T:%.2f", TempVal);
+		lcd_send_string(lcd_temp_buf);
+		lcd_put_cur(1, 0);
+		sprintf((char *)lcd_wl_buf,"W:%.2f", WaterLevelValue);
+		lcd_send_string(lcd_wl_buf);
+
+
+		sprintf((char*)tx_buf,"\nTemperatureValue :%.2f \r\n",TempVal);
+		HAL_UART_Transmit(&huart1, tx_buf, strlen((char*)tx_buf),100);
+		sprintf((char*)tx_buf,"adcVal : %d pressureValue :%.2f \r\n",PressureSensorADCValue,PressureValue);
+		HAL_UART_Transmit(&huart1, tx_buf, strlen((char*)tx_buf),100);
+		sprintf((char*)tx_buf,"adcVal : %d Waterlvl :%.2f \r\n",WaterLevelSensorADCValue,WaterLevelValue);
+		HAL_UART_Transmit(&huart1, tx_buf, strlen((char*)tx_buf),100);
+		osDelay(100);
+	}
+}
+
+static void MainTask()
+{
+	//if Steam ON button is pressed open valve and hold
+	//if Steam OFF button is pressed close valve and hold
+
+	while(1)
+	{
+		osDelay(20);
+
+			if( HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_10) == GPIO_PIN_RESET ) 	//User button press
+			{
+				if(xTimerStart(timer_1, 0) == pdPASS)
+				{
+					HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15,GPIO_PIN_RESET);
+				}
+			}
+	}
+}
+
+
+static void SVOffCallback(TimerHandle_t xTimer)
+{
+
+//	strcpy((char*)StatusBuffer,"\n****Timer OFF Invoked**** \r\n");
+//	HAL_UART_Transmit(&huart1, StatusBuffer, strlen((char *)StatusBuffer), HAL_MAX_DELAY);
+	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15,GPIO_PIN_SET);
+}
+
+-------------------------------------------------------------------------------------------------------------------------------
+
+MAX 6675.h code:
+#include"MAX6675.h"
+#include "cmsis_os.h"
+extern SPI_HandleTypeDef hspi1;
+
+// ------------------- Variables ----------------
+_Bool TCF=0;                                          // Thermocouple Connection acknowledge Flag
+uint8_t DATARX[2];                                    // Raw Data from MAX6675
+float Temp=0;                                         // Temperature Variable
+
+// ------------------- Functions ----------------
+float Max6675_Read_Temp(void)
+{
+HAL_GPIO_WritePin(SSPORT,SSPIN,GPIO_PIN_RESET);       // Low State for SPI Communication
+HAL_SPI_Receive(&hspi1,DATARX,1,50);                  // DATA Transfer
+HAL_GPIO_WritePin(SSPORT,SSPIN,GPIO_PIN_SET);         // High State for SPI Communication
+TCF=(((DATARX[0]|(DATARX[1]<<8))>>2)& 0x0001);        // State of Connecting
+Temp=((((DATARX[0]|DATARX[1]<<8)))>>3);               // Temperature Data Extraction
+Temp*=0.25;                                           // Data to Centigrade Conversation
+osDelay(300);                                       // Waits for Chip Ready(according to Datasheet, the max time for conversion is 220ms)
+return Temp;
+}
+
+-------------------------------------------------------------------------------------------------------------------------------
+
+MAX 6675 code:
+#include"MAX6675.h"
+#include "cmsis_os.h"
+extern SPI_HandleTypeDef hspi1;
+
+// ------------------- Variables ----------------
+_Bool TCF=0;                                          // Thermocouple Connection acknowledge Flag
+uint8_t DATARX[2];                                    // Raw Data from MAX6675
+float Temp=0;                                         // Temperature Variable
+
+
+// ------------------- Functions ----------------
+float Max6675_Read_Temp(void)
+{
+HAL_GPIO_WritePin(SSPORT,SSPIN,GPIO_PIN_RESET);       // Low State for SPI Communication
+HAL_SPI_Receive(&hspi1,DATARX,1,50);                  // DATA Transfer
+HAL_GPIO_WritePin(SSPORT,SSPIN,GPIO_PIN_SET);         // High State for SPI Communication
+TCF=(((DATARX[0]|(DATARX[1]<<8))>>2)& 0x0001);        // State of Connecting
+Temp=((((DATARX[0]|DATARX[1]<<8)))>>3);               // Temperature Data Extraction
+Temp*=0.25;                                           // Data to Centigrade Conversation
+osDelay(300);                                       // Waits for Chip Ready(according to Datasheet, the max time for conversion is 220ms)
+return Temp;
+}
+
+-------------------------------------------------------------------------------------------------------------------------------
+LCD_Display.c code:
+
+#include "LCD_Display.h"
+#include "cmsis_os.h"
+
+extern I2C_HandleTypeDef hi2c1;  
+
+#define SLAVE_ADDRESS_LCD 0x4E			
+extern uint8_t tx_buf[50];
+
+void lcd_send_cmd (char cmd)
+{
+  char data_u, data_l;
+	uint8_t data_t[4];
+	data_u = (cmd&0xf0);
+	data_l = ((cmd<<4)&0xf0);
+	data_t[0] = data_u|0x0C;  //en=1, rs=0
+	data_t[1] = data_u|0x08;  //en=0, rs=0
+	data_t[2] = data_l|0x0C;  //en=1, rs=0
+	data_t[3] = data_l|0x08;  //en=0, rs=0
+	HAL_I2C_Master_Transmit (&hi2c1, SLAVE_ADDRESS_LCD,(uint8_t *) data_t, 4, 100);
+}
+
+void lcd_send_data (char data)
+{
+	char data_u, data_l;
+	uint8_t data_t[4];
+	data_u = (data&0xf0);
+	data_l = ((data<<4)&0xf0);
+	data_t[0] = data_u|0x0D;  //en=1, rs=0
+	data_t[1] = data_u|0x09;  //en=0, rs=0
+	data_t[2] = data_l|0x0D;  //en=1, rs=0
+	data_t[3] = data_l|0x09;  //en=0, rs=0
+	HAL_I2C_Master_Transmit (&hi2c1, SLAVE_ADDRESS_LCD,(uint8_t *) data_t, 4, 100);
+}
+
+void lcd_clear (void)
+{
+	lcd_send_cmd (0x80);	//Force cursor to the beginning ( 1st line)
+	for (int i=0; i<70; i++)
+	{
+		lcd_send_data (' ');
+	}
+}
+
+void lcd_put_cur(int row, int col)
+{
+    switch (row)
+    {
+        case 0:
+            col |= 0x80;	//Force cursor to the beginning ( 1st line)
+            break;
+        case 1:
+            col |= 0xC0;	//Force cursor to the beginning ( 2nd line)
+            break;
+    }
+
+    lcd_send_cmd (col);
+}
+void lcd_init (void)
+{
+	// 4 bit initialisation
+	osDelay(50);  // wait for >40ms
+	lcd_send_cmd (0x30);
+	osDelay(5);  // wait for >4.1ms
+	lcd_send_cmd (0x30);
+	osDelay(1);  // wait for >100us
+	lcd_send_cmd (0x30);
+	osDelay(10);
+	lcd_send_cmd (0x20);  // 4bit mode
+	osDelay(10);
+  // dislay initialisation
+	lcd_send_cmd (0x28); // Function set --> DL=0 (4 bit mode), N = 1 (2 line display) F = 0 (5x8 characters)
+	osDelay(1);
+	lcd_send_cmd (0x08); //Display on/off control --> D=0,C=0, B=0  ---> display off
+	osDelay(1);
+	lcd_send_cmd (0x01);  // clear display
+	osDelay(1);
+	osDelay(1);
+	lcd_send_cmd (0x06); //Entry mode set --> I/D = 1 (increment cursor) & S = 0 (no shift)
+	osDelay(1);
+	lcd_send_cmd (0x0C); //Display on/off control --> D = 1, C and B = 0. (Cursor and blink, last two bits)
+	osDelay(1);
+}
+void lcd_send_string (char *str)
+{
+	while (*str) lcd_send_data (*str++);
+}
